@@ -586,6 +586,49 @@ fn recover_color_enum(c: &dxf::Color) -> i16 {
     }
 }
 
+/// [iota][`joto_constants::f64::IOTA`] scaling factor for given [`dxf::enums::Units`].
+fn units_scaling_factor(units: dxf::enums::Units) -> f64 {
+    use dxf::enums::Units::*;
+    use joto_constants::f64 as u;
+    let base_unit = match units {
+        Inches => u::INCH,
+        Feet => u::FOOT,
+        Yards => u::YARD,
+        Miles => u::YARD * 1760.0,
+        Mils => u::THOU,
+        Nanometers => u::NANOMETER,
+        Microns => u::MICROMETER,
+        Millimeters => u::MILLIMETER,
+        Centimeters => u::CENTIMETER,
+        Decimeters => u::CENTIMETER * 10.0,
+        Meters => u::METER,
+        Decameters => u::METER * 10.0,
+        Hectometers => u::METER * 100.0,
+        Kilometers => u::METER * 1000.0,
+
+        // Not exact, but also generally not in use.
+        USSurveyInch => (u::METER * 100.0) / 3937.0,
+        USSurveyFeet => (u::METER * 1200.0) / 3937.0,
+        USSurveyYard => (u::METER * 3600.0) / 3937.0,
+        USSurveyMile => u::MILLIMETER * 1_609_347.0,
+
+        // DXF supports many cursed units, maybe some
+        // should just be treated as unitless.
+        Angstroms => u::NANOMETER / 10.0,
+        Microinches => u::THOU / 1_000.0,
+        Gigameters => u::METER * 1_000_000.0,
+        AstronomicalUnits => u::METER * 149_597_870_700.0,
+        LightYears => u::METER * 9_460_730_472_580_800.0,
+        Parsecs => u::METER * (96_939_420_213_600_000.0 / core::f64::consts::PI),
+
+        // This experimentally discovered factor fixes the majority of nonphysical
+        // or otherwise unitless drawings without blowing out `f32` precision.
+        Unitless => 64. * 1024. * 1024. * 1024.,
+    };
+    // Adjust for rendering scale.
+    base_unit * (128_f64 * 1024_f64 * 1024_f64).recip()
+}
+
 /// Load a DXF from a path into a [`TDDrawing`].
 #[cfg(feature = "std")]
 #[tracing::instrument(skip_all)]
@@ -604,6 +647,8 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
     });
 
     let drawing = Drawing::load_file(path)?;
+
+    let scale_factor = units_scaling_factor(drawing.header.default_drawing_units);
 
     let visible_layers: BTreeSet<&str> = drawing
         .layers()
@@ -730,7 +775,9 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                                     ins.x_scale_factor,
                                     ins.y_scale_factor,
                                 );
-                                let location = point_from_dxf_point(&ins.location);
+                                let location = (point_from_dxf_point(&ins.location).to_vec2()
+                                    * scale_factor)
+                                    .to_point();
 
                                 if !lines.is_empty() {
                                     // Always push a chunk before an insert if not empty.
@@ -775,7 +822,7 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                         }
                         _ => {
                             if let Some(s) = path_from_entity(e) {
-                                lines.extend(s);
+                                lines.extend(Affine::scale(scale_factor) * s);
                             }
                         }
                     }
@@ -799,7 +846,7 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                 //        at least for shx line fonts.
                 // When this is zero, the height from the TEXT/MTEXT entity is used;
                 // when this is nonzero, the height from the TXT/MTEXT is ignored.
-                let size = s.text_height;
+                let size = s.text_height * scale_factor;
                 let mut pstyle: StyleSet<Option<Color>> = StyleSet::new(size as f32);
                 pstyle.insert(StyleProperty::LineHeight(1.0));
                 pstyle.insert(StyleProperty::FontWidth(FontWidth::from_ratio(
@@ -972,7 +1019,8 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                 if let Some(b) = blocks.get(ins.name.as_str()) {
                     let base_transform =
                         Affine::scale_non_uniform(ins.x_scale_factor, ins.y_scale_factor);
-                    let location = point_from_dxf_point(&ins.location);
+                    let location =
+                        (point_from_dxf_point(&ins.location).to_vec2() * scale_factor).to_point();
 
                     for (lw, ce, clines) in b {
                         let chunk_paint = resolve_paint(
@@ -1081,8 +1129,9 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                 } else {
                     match mt.column_type {
                         0 => (mt.reference_rectangle_width != 0.0)
-                            .then_some(mt.reference_rectangle_width as f32),
-                        1 => (mt.column_width != 0.0).then_some(mt.column_width as f32),
+                            .then_some((mt.reference_rectangle_width * scale_factor) as f32),
+                        1 => (mt.column_width != 0.0)
+                            .then_some((mt.column_width * scale_factor) as f32),
                         _ => None,
                     }
                 };
@@ -1095,12 +1144,12 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                         text: nt.into(),
                         // TODO: Map more styling information from the MText
                         style: styles.get(mt.text_style_name.as_str()).map_or_else(
-                            || StyleSet::new(mt.initial_text_height as f32),
+                            || StyleSet::new((mt.initial_text_height * scale_factor) as f32),
                             |s| {
                                 if style_size_is_zero(s) {
                                     let mut news = s.clone();
                                     news.insert(StyleProperty::FontSize(
-                                        mt.initial_text_height as f32,
+                                        (mt.initial_text_height * scale_factor) as f32,
                                     ));
                                     news
                                 } else {
@@ -1112,7 +1161,7 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                         insertion: DirectIsometry::new(
                             // As far as I'm aware, x_axis_direction and rotation are exclusive.
                             -mt.rotation_angle.to_radians() + x_angle,
-                            point_from_dxf_point(&mt.insertion_point).to_vec2(),
+                            point_from_dxf_point(&mt.insertion_point).to_vec2() * scale_factor,
                         ),
                         max_inline_size,
                         attachment_point,
@@ -1153,11 +1202,13 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                         paint: entity_paint,
                         text: text.into(),
                         style: styles.get(t.text_style_name.as_str()).map_or_else(
-                            || StyleSet::new(t.text_height as f32),
+                            || StyleSet::new((t.text_height * scale_factor) as f32),
                             |s| {
                                 let mut sized = if style_size_is_zero(s) {
                                     let mut news = s.clone();
-                                    news.insert(StyleProperty::FontSize(t.text_height as f32));
+                                    news.insert(StyleProperty::FontSize(
+                                        (t.text_height * scale_factor) as f32,
+                                    ));
                                     news
                                 } else {
                                     s.clone()
@@ -1173,7 +1224,7 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                         alignment: Default::default(),
                         insertion: DirectIsometry::new(
                             -t.rotation.to_radians(),
-                            point_from_dxf_point(&t.location).to_vec2(),
+                            point_from_dxf_point(&t.location).to_vec2() * scale_factor,
                         ),
                         max_inline_size: None,
                         attachment_point: Default::default(),
@@ -1186,7 +1237,7 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                     push_item(
                         &mut gb,
                         FatShape {
-                            path: sync::Arc::from(s),
+                            path: sync::Arc::from(Affine::scale(scale_factor) * s),
                             paint: entity_paint,
                             ..Default::default()
                         }
