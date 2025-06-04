@@ -3,6 +3,7 @@
 
 //! DXF loader for Tabulon
 
+pub use dxf;
 use dxf::{entities::EntityType, Drawing, DxfResult};
 
 use tabulon::{
@@ -38,6 +39,14 @@ use aci_palette::ACI;
 /// A valid handle for an [`Entity`](dxf::entities::Entity) present in the drawing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EntityHandle(pub(crate) NonZeroU64);
+
+impl TryFrom<&dxf::entities::EntityCommon> for EntityHandle {
+    type Error = ();
+
+    fn try_from(c: &dxf::entities::EntityCommon) -> Result<Self, Self::Error> {
+        NonZeroU64::new(c.handle.0).map(Self).ok_or(())
+    }
+}
 
 /// A valid handle for a [`Layer`](dxf::tables::Layer) present in the drawing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
