@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "drawing_types",
     "tabulon",
     "tabulon_dxf",
     "tabulon_vello",
@@ -23,6 +24,7 @@ license = "Apache-2.0 OR MIT"
 repository = "https://github.com/endoli/tabulon"
 
 [workspace.dependencies]
+drawing_types = { version = "0.1.0", path = "drawing_types", default-features = false }
 tabulon = { version = "0.1.0", path = "tabulon", default-features = false }
 tabulon_dxf = { version = "0.1.0", path = "tabulon_dxf" }
 tabulon_vello = { version = "0.1.0", path = "tabulon_vello", default-features = false }

@@ -1,0 +1,21 @@
+[package]
+name = "drawing_types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["std"]
+std = [
+    "peniko/std"
+]
+
+[dependencies]
+peniko = "0.4.0"
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[lints]
