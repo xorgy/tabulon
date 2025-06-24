@@ -2852,8 +2852,7 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 [[package]]
 name = "ui-events"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4c2cc34489c685d4e7a1a1f97b7b4416c5aa789892114ae77df6cd2a60f0ec4"
+source = "git+https://github.com/xorgy/ui-events?branch=pointer-relative-motion#33ee69f3795be8ecbb8a9f7e05b326580ce22f3c"
 dependencies = [
  "dpi",
  "keyboard-types",
@@ -2862,10 +2861,10 @@ dependencies = [
 [[package]]
 name = "ui-events-winit"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61de84ebdb9c2e756d18fcd378802b5a0d359863fcee3ced54ac2d2fbb19cf74"
+source = "git+https://github.com/xorgy/ui-events?branch=pointer-relative-motion#33ee69f3795be8ecbb8a9f7e05b326580ce22f3c"
 dependencies = [
  "ui-events",
+ "web-time",
  "winit",
 ]
 

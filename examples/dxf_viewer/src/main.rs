@@ -14,9 +14,12 @@ use std::time::Instant;
 use tracing_subscriber::prelude::*;
 use ui_events::{
     ScrollDelta,
-    pointer::{PointerButton, PointerEvent, PointerId, PointerInfo, PointerType, PointerUpdate},
+    pointer::{
+        PointerButton, PointerButtonEvent, PointerEvent, PointerId, PointerInfo,
+        PointerRelativeMotion, PointerScrollEvent, PointerType, PointerUpdate,
+    },
 };
-use ui_events_winit::{WindowEventReducer, WindowEventTranslation};
+use ui_events_winit::{EventTranslation, WindowEventReducer};
 use vello::kurbo::{
     Affine, DEFAULT_ACCURACY, ParamCurveNearest, PathSeg, Point, Rect, Shape, Stroke, Vec2,
 };
@@ -25,9 +28,9 @@ use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{DeviceEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::window::Window;
+use winit::window::{CursorGrabMode, Fullscreen, Window};
 
 use vello::wgpu;
 
@@ -54,12 +57,23 @@ enum RenderState<'s> {
     Suspended(Option<Arc<Window>>),
 }
 
-#[derive(Default)]
 struct GestureState {
     /// Pointer currently panning.
     pan: Option<PointerId>,
     /// Cursor position.
     cursor_pos: Point,
+    /// Cursor grab mode.
+    grab_mode: CursorGrabMode,
+}
+
+impl Default for GestureState {
+    fn default() -> Self {
+        Self {
+            pan: Default::default(),
+            cursor_pos: Default::default(),
+            grab_mode: CursorGrabMode::None,
+        }
+    }
 }
 
 struct DrawingViewer {
@@ -233,6 +247,41 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
     }
 
     #[tracing::instrument(skip_all)]
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        let window = match &mut self.state {
+            RenderState::Active { window, .. } => window,
+            _ => return,
+        };
+
+        let Some(viewer) = &mut self.viewer else {
+            return;
+        };
+
+        match self.event_reducer.reduce_device_event(&event) {
+            Some(EventTranslation::Pointer(PointerEvent::RelativeMotion(
+                PointerRelativeMotion {
+                    pointer: PointerInfo { pointer_id, .. },
+                    total,
+                    ..
+                },
+            ))) if viewer.gestures.pan == pointer_id => {
+                viewer.view_transform = viewer.view_transform.then_translate(Vec2 {
+                    x: total.distance.x,
+                    y: total.distance.y,
+                });
+                viewer.defer_reprojection = true;
+                window.request_redraw();
+            }
+            _ => {}
+        }
+    }
+
+    #[tracing::instrument(skip_all)]
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -259,19 +308,38 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
         ) {
             if let Some(wet) = self.event_reducer.reduce(&event) {
                 match wet {
-                    WindowEventTranslation::Keyboard(k) => {
+                    EventTranslation::Keyboard(k) => {
                         use ui_events::keyboard::{Key, NamedKey};
-                        if k.state.is_down() && matches!(k.key, Key::Named(NamedKey::Escape)) {
-                            event_loop.exit();
+                        if k.state.is_down() {
+                            match k.key {
+                                Key::Named(NamedKey::Escape) => {
+                                    if let Some(_) = window.fullscreen() {
+                                        window.set_fullscreen(None);
+                                    } else {
+                                        event_loop.exit();
+                                    }
+                                }
+                                Key::Character(c) if c == "q" => {
+                                    event_loop.exit();
+                                }
+                                Key::Character(c) if c == "f" => {
+                                    if let Some(_) = window.fullscreen() {
+                                        window.set_fullscreen(None);
+                                    } else {
+                                        window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
-                    WindowEventTranslation::Pointer(p) => {
+                    EventTranslation::Pointer(p) => {
                         let Some(viewer) = &mut self.viewer else {
                             return;
                         };
 
                         match p {
-                            PointerEvent::Down {
+                            PointerEvent::Down(PointerButtonEvent {
                                 pointer:
                                     PointerInfo {
                                         pointer_id,
@@ -280,8 +348,8 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                                     },
                                 button: Some(PointerButton::Primary),
                                 state,
-                            }
-                            | PointerEvent::Down {
+                            })
+                            | PointerEvent::Down(PointerButtonEvent {
                                 pointer:
                                     PointerInfo {
                                         pointer_id,
@@ -290,13 +358,19 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                                     },
                                 state,
                                 ..
-                            } => {
+                            }) => {
                                 if viewer.gestures.pan.is_none() {
                                     viewer.gestures.pan = pointer_id;
                                     viewer.gestures.cursor_pos = Point {
                                         x: state.position.x,
                                         y: state.position.y,
-                                    }
+                                    };
+                                    // if window.set_cursor_grab(CursorGrabMode::Locked).is_ok() {
+                                    //     viewer.gestures.grab_mode = CursorGrabMode::Locked;
+                                    // } else
+                                    // if window.set_cursor_grab(CursorGrabMode::Confined).is_ok() {
+                                    //     viewer.gestures.grab_mode = CursorGrabMode::Confined;
+                                    // }
                                 }
                             }
                             PointerEvent::Move(PointerUpdate {
@@ -311,12 +385,9 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
 
                                 let dp = viewer.view_transform.inverse() * p;
 
-                                if viewer.gestures.pan == pointer_id {
-                                    viewer.view_transform = viewer
-                                        .view_transform
-                                        .then_translate(-(viewer.gestures.cursor_pos - p));
-                                    reproject = true;
-                                } else if pointer_id == Some(PointerId::PRIMARY) {
+                                if viewer.gestures.pan != pointer_id
+                                    && pointer_id == Some(PointerId::PRIMARY)
+                                {
                                     let pick_dist: f64 = window.scale_factor() * 1.414;
                                     let pick_started = Instant::now();
 
@@ -341,16 +412,33 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
 
                                 viewer.gestures.cursor_pos = p;
                             }
-                            PointerEvent::Up {
+                            PointerEvent::RelativeMotion(PointerRelativeMotion {
+                                pointer: PointerInfo { pointer_id, .. },
+                                total,
+                                ..
+                            }) => {
+                                if viewer.gestures.pan == pointer_id {
+                                    viewer.view_transform =
+                                        viewer.view_transform.then_translate(Vec2 {
+                                            x: total.distance.x,
+                                            y: total.distance.y,
+                                        });
+                                    reproject = true;
+                                }
+                            }
+                            PointerEvent::Up(PointerButtonEvent {
                                 pointer: PointerInfo { pointer_id, .. },
                                 ..
-                            }
+                            })
                             | PointerEvent::Cancel(PointerInfo { pointer_id, .. }) => {
                                 if viewer.gestures.pan == pointer_id {
                                     viewer.gestures.pan = None;
+                                    if window.set_cursor_grab(CursorGrabMode::None).is_ok() {
+                                        viewer.gestures.grab_mode = CursorGrabMode::None;
+                                    }
                                 }
                             }
-                            PointerEvent::Scroll { delta, .. } => {
+                            PointerEvent::Scroll(PointerScrollEvent { delta, .. }) => {
                                 let d = match delta {
                                     ScrollDelta::LineDelta(_, y) => y as f64 * 0.1,
                                     ScrollDelta::PixelDelta(pd) => pd.y * 0.05,
