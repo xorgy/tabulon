@@ -38,7 +38,8 @@ use dpi::PhysicalPosition;
 use joto_constants::length::u64::{INCH, MICROMETER};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
 use tracing_subscriber::prelude::*;
@@ -110,31 +111,317 @@ enum GestureState {
     },
 }
 
-struct DrawingViewer {
-    /// `tabulon_dxf` drawing.
-    td: TDDrawing,
+// --- Reprojection worker ---
 
-    /// Index of bounding boxes for hit testing.
+/// Read-only drawing data shared between the main thread and the worker.
+struct SharedDrawing {
+    render_layer: RenderLayer,
     picking_index: EntityIndex,
+    text_cull_index: TextCullIndex,
+    layout_cache: tabulon_vello::LayoutCache,
+    item_entity_map: BTreeMap<ItemHandle, EntityHandle>,
+    restroke_paints: Arc<[RestrokePaint]>,
+}
+
+/// Parameters for a reprojection request.
+#[derive(Clone, Copy)]
+struct ReprojectParams {
+    view_transform: Affine,
+    view_scale: f64,
+    scale_factor: f64,
+    width: u32,
+    height: u32,
+    pick: Option<EntityHandle>,
+}
+
+/// Shared state for the reprojection worker pool.
+struct PoolComm {
+    /// Latest params with a generation counter. Workers take from here.
+    pending: Mutex<Option<(u64, ReprojectParams)>>,
+    /// Wake workers when new params arrive (or on shutdown).
+    condvar: Condvar,
+    /// Freshest completed scene. `(generation, scene)`.
+    completed: Mutex<(u64, Option<Scene>)>,
+    shutdown: AtomicBool,
+    /// Generation counter, incremented by the main thread.
+    generation: AtomicU64,
+}
+
+/// Pool of reprojection worker threads.
+///
+/// Each worker has its own clone of the [`GraphicsBag`] and
+/// [`tabulon_vello::Environment`], allowing multiple reprojections to
+/// run concurrently. Workers compete for the latest params; only the
+/// freshest completed scene is kept.
+struct ReprojectPool {
+    comm: Arc<PoolComm>,
+    threads: Vec<thread::JoinHandle<()>>,
+}
+
+/// Number of reprojection worker threads (1/4 of available CPUs, minimum 2).
+fn reproject_worker_count() -> usize {
+    thread::available_parallelism().map_or(2, |n| (n.get() / 4).max(2))
+}
+
+impl ReprojectPool {
+    fn start(
+        shared: Arc<SharedDrawing>,
+        graphics: GraphicsBag,
+        environment: tabulon_vello::Environment,
+        window: Arc<Window>,
+    ) -> Self {
+        let comm = Arc::new(PoolComm {
+            pending: Mutex::new(None),
+            condvar: Condvar::new(),
+            completed: Mutex::new((0, None)),
+            shutdown: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+        });
+
+        let worker_count = reproject_worker_count();
+        eprintln!("Starting {worker_count} reprojection workers.");
+        let mut threads = Vec::with_capacity(worker_count);
+        let mut envs: Vec<tabulon_vello::Environment> = Vec::new();
+        envs.push(environment); // worker 0 gets the caller's environment
+        for _ in 1..worker_count {
+            envs.push(tabulon_vello::Environment::default());
+        }
+
+        for i in 0..worker_count {
+            let worker_comm = Arc::clone(&comm);
+            let worker_shared = Arc::clone(&shared);
+            let mut worker_graphics = graphics.clone();
+            let mut worker_env = envs.remove(0);
+            let worker_window = Arc::clone(&window);
+
+            let t = thread::Builder::new()
+                .name(format!("reproject-{i}"))
+                .spawn(move || {
+                    let mut scene = Scene::new();
+
+                    loop {
+                        // Wait for params (or shutdown).
+                        let (generation, params) = {
+                            let mut pending = worker_comm.pending.lock().unwrap();
+                            loop {
+                                if worker_comm.shutdown.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                if let Some(gp) = pending.take() {
+                                    break gp;
+                                }
+                                pending = worker_comm.condvar.wait(pending).unwrap();
+                            }
+                        };
+
+                        let started = Instant::now();
+
+                        reproject_scene(
+                            &params,
+                            &worker_shared,
+                            &mut worker_graphics,
+                            &mut worker_env,
+                            &mut scene,
+                        );
+
+                        let duration = Instant::now().saturating_duration_since(started);
+                        eprintln!("reproject-{i}: took {duration:?} (gen {generation})");
+
+                        // Publish only if our generation is the freshest.
+                        {
+                            let mut slot = worker_comm.completed.lock().unwrap();
+                            if generation > slot.0 {
+                                let old = slot.1.take();
+                                *slot = (generation, Some(scene));
+                                scene = old.unwrap_or_default();
+                            }
+                        }
+
+                        worker_window.request_redraw();
+
+                        // Loop back immediately — if newer params
+                        // arrived while we were working, take them
+                        // without waiting.
+                    }
+                })
+                .expect("failed to spawn reproject thread");
+
+            threads.push(t);
+        }
+
+        Self { comm, threads }
+    }
+
+    /// Write the latest view params and wake an idle worker.
+    fn update_params(&self, params: ReprojectParams) {
+        let g = self.comm.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        *self.comm.pending.lock().unwrap() = Some((g, params));
+        self.comm.condvar.notify_one();
+    }
+
+    /// Take the latest completed scene, if available, along with its generation.
+    fn take_scene(&self) -> Option<(u64, Scene)> {
+        let mut slot = self.comm.completed.lock().unwrap();
+        let g = slot.0;
+        slot.1.take().map(|s| (g, s))
+    }
+
+    /// Return the latest generation requested.
+    fn current_generation(&self) -> u64 {
+        self.comm.generation.load(Ordering::Relaxed)
+    }
+
+    /// Shut down all worker threads.
+    fn shutdown(&mut self) {
+        self.comm.shutdown.store(true, Ordering::Relaxed);
+        self.comm.condvar.notify_all();
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for ReprojectPool {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Perform one reprojection + scene encoding.
+fn reproject_scene(
+    params: &ReprojectParams,
+    shared: &SharedDrawing,
+    graphics: &mut GraphicsBag,
+    environment: &mut tabulon_vello::Environment,
+    scene: &mut Scene,
+) {
+    update_transform(
+        graphics,
+        shared.restroke_paints.clone(),
+        params.view_transform,
+        params.view_scale,
+        params.scale_factor,
+    );
+
+    let tl = params.view_transform.inverse() * Point { x: 0., y: 0. };
+    let br = params.view_transform.inverse()
+        * Point {
+            x: params.width as f64,
+            y: params.height as f64,
+        };
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "The loss of range and precision is acceptable."
+    )]
+    let visible =
+        shared
+            .picking_index
+            .query_items(tl.x as f32, tl.y as f32, br.x as f32, br.y as f32);
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "The loss of range and precision is acceptable."
+    )]
+    let visible_text =
+        shared
+            .text_cull_index
+            .query_items(tl.x as f32, tl.y as f32, br.x as f32, br.y as f32);
+
+    let culled_render_layer = RenderLayer {
+        indices: shared
+            .render_layer
+            .indices
+            .iter()
+            .copied()
+            .filter(|ih| match graphics.get(*ih) {
+                GraphicsItem::FatShape(..) => visible.binary_search(ih).is_ok(),
+                GraphicsItem::FatText(..) => visible_text.contains(ih),
+            })
+            .collect(),
+    };
+
+    scene.reset();
+    environment.add_render_layer_to_scene(
+        scene,
+        graphics,
+        &culled_render_layer,
+        Some(&shared.layout_cache),
+    );
+
+    // Highlight picked entity.
+    if let Some(pick) = params.pick {
+        let mut gb = GraphicsBag::default();
+        let mut rl = RenderLayer::default();
+
+        gb.update_transform(Default::default(), params.view_transform);
+
+        let paint = gb.register_paint(FatPaint {
+            stroke: Stroke::new(1.414 / params.view_scale),
+            stroke_paint: Some(palette::css::GOLDENROD.into()),
+            fill_paint: None,
+        });
+
+        culled_render_layer
+            .indices
+            .iter()
+            .filter(|ih| shared.item_entity_map.get(ih) == Some(&pick))
+            .for_each(|ih| {
+                let GraphicsItem::FatShape(FatShape {
+                    transform, path, ..
+                }) = graphics.get(*ih)
+                else {
+                    return;
+                };
+                rl.push_with_bag(
+                    &mut gb,
+                    FatShape {
+                        transform: *transform,
+                        path: path.clone(),
+                        paint,
+                    },
+                );
+            });
+
+        environment.add_render_layer_to_scene(scene, &gb, &rl, None);
+    }
+}
+
+// --- Viewer state ---
+
+struct DrawingViewer {
+    /// Shared drawing data (read-only, used by worker and main thread).
+    shared: Arc<SharedDrawing>,
+
+    /// Reprojection worker pool.
+    pool: ReprojectPool,
+
     /// Which shape is closest to the cursor?
     pick: Option<EntityHandle>,
-
-    /// Index of bounding boxes for culling texts.
-    text_cull_index: TextCullIndex,
 
     /// View transform of the drawing.
     view_transform: Affine,
     /// View scale of the drawing.
     view_scale: f64,
 
-    /// Defer reprojection until after redraw is completed.
-    defer_reprojection: bool,
+    /// Generation of the scene most recently rendered.
+    rendered_generation: u64,
 
     /// State of gesture processing (e.g. panning, zooming).
     gestures: GestureState,
+}
 
-    /// Cache of precomputed text layouts.
-    layout_cache: tabulon_vello::LayoutCache,
+impl DrawingViewer {
+    fn reproject_params(&self, surface: &RenderSurface<'_>, scale_factor: f64) -> ReprojectParams {
+        ReprojectParams {
+            view_transform: self.view_transform,
+            view_scale: self.view_scale,
+            scale_factor,
+            width: surface.config.width,
+            height: surface.config.height,
+            pick: self.pick,
+        }
+    }
 }
 
 struct TabulonDxfViewer<'s> {
@@ -150,9 +437,6 @@ struct TabulonDxfViewer<'s> {
     /// A vello Scene which is a data structure which allows one to build up a description a scene to be
     /// drawn (with paths, fills, images, text, etc) which is then passed to a renderer for rendering.
     scene: Scene,
-
-    /// Tabulon Vello environment.
-    tv_environment: tabulon_vello::Environment,
 
     /// ui-events `WindowEvent` reducer.
     event_reducer: WindowEventReducer,
@@ -174,102 +458,35 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
             .take()
             .unwrap_or_else(|| create_winit_window(event_loop));
 
-        // Create a vello Surface.
         let size = window.inner_size();
-        let surface_future = {
-            let surface = self
-                .context
-                .instance
-                .create_surface(wgpu::SurfaceTarget::from(window.clone()))
-                .expect("Error creating surface");
-            let dev_id = pollster::block_on(self.context.device(Some(&surface)))
-                .expect("No compatible device");
-            let device_handle = &self.context.devices[dev_id];
-            let capabilities = surface.get_capabilities(device_handle.adapter());
-            let present_mode = if capabilities
-                .present_modes
-                .contains(&wgpu::PresentMode::Mailbox)
-            {
-                wgpu::PresentMode::Mailbox
-            } else {
-                wgpu::PresentMode::AutoVsync
-            };
-            self.context
-                .create_render_surface(surface, size.width, size.height, present_mode)
-        };
+        let mut surface = pollster::block_on(self.context.create_surface(
+            window.clone(),
+            size.width,
+            size.height,
+            wgpu::PresentMode::AutoVsync,
+        ))
+        .expect("Error creating surface");
 
-        let scale_factor = window.scale_factor();
+        if let Some(arg_path) = std::env::args().nth(1) {
+            surface.config.width = size.width;
+            surface.config.height = size.height;
 
-        let surface = pollster::block_on(surface_future).expect("Error creating surface");
+            match load_drawing(&arg_path) {
+                Ok(drawing) => {
+                    window.set_title(&["Tabulon DXF Viewer — ", &arg_path].concat());
 
-        // Create a vello Renderer for the surface (using its device id).
-        self.renderers
-            .resize_with(self.context.devices.len(), || None);
-        self.renderers[surface.dev_id]
-            .get_or_insert_with(|| create_vello_renderer(&self.context, &surface));
+                    self.viewer = Some(setup_viewer(
+                        drawing,
+                        &surface,
+                        window.scale_factor(),
+                        window.clone(),
+                    ));
 
-        if let Some(path_arg) = std::env::args().next_back() {
-            match load_drawing(&path_arg) {
-                Ok(mut drawing) => {
-                    let mut title = String::from("Tabulon DXF Viewer — ");
-                    title.push_str(
-                        Path::new(&path_arg)
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_str()
-                            .unwrap_or_default(),
-                    );
-                    window.set_title(&title);
-
-                    let picking_index = EntityIndex::new(&drawing);
-                    let bounds = picking_index.bounds();
-
-                    let (layout_cache, measurements) =
-                        self.tv_environment.compute_text_layouts_and_measures(
-                            &drawing.graphics,
-                            &drawing.render_layer,
-                        );
-
-                    let text_cull_index = TextCullIndex::new(&measurements);
-
-                    let view_scale = (size.height as f64 / bounds.size().height)
-                        .min(size.width as f64 / bounds.size().width);
-
-                    let view_transform = Affine::translate(Vec2 {
-                        x: -bounds.min_x(),
-                        y: -bounds.min_y(),
-                    })
-                    .then_scale(view_scale);
-                    update_transform(
-                        &mut drawing.graphics,
-                        drawing.restroke_paints.clone(),
-                        view_transform,
-                        view_scale,
-                        scale_factor,
-                    );
-                    self.scene.reset();
-
-                    let encode_started = Instant::now();
-                    self.tv_environment.add_render_layer_to_scene(
-                        &mut self.scene,
-                        &drawing.graphics,
-                        &drawing.render_layer,
-                        Some(&layout_cache),
-                    );
-                    let encode_duration = Instant::now().saturating_duration_since(encode_started);
-                    eprintln!("Initial projection/encode took {encode_duration:?}");
-
-                    self.viewer = Some(DrawingViewer {
-                        td: drawing,
-                        picking_index,
-                        view_scale,
-                        view_transform,
-                        text_cull_index,
-                        gestures: GestureState::default(),
-                        defer_reprojection: true,
-                        pick: None,
-                        layout_cache,
-                    });
+                    // Kick off initial reprojection.
+                    let viewer = self.viewer.as_ref().unwrap();
+                    viewer
+                        .pool
+                        .update_params(viewer.reproject_params(&surface, window.scale_factor()));
                 }
                 Err(e) => {
                     tracing::error!("Failed to load drawing: {e}");
@@ -277,7 +494,12 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
             }
         }
 
-        // Save the Window and Surface to a state variable.
+        if self.renderers.len() <= surface.dev_id {
+            self.renderers.resize_with(surface.dev_id + 1, || None);
+        }
+        self.renderers[surface.dev_id]
+            .get_or_insert_with(|| create_vello_renderer(&self.context, &surface));
+
         self.state = RenderState::Active {
             surface: Box::new(surface),
             window,
@@ -319,9 +541,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
             y: size.height * 0.5,
         };
 
-        let mut reproject = false;
-        // Set if reprojection is requested as a result of a deferral.
-        let mut reproject_deferred = false;
+        let mut view_changed = false;
 
         if !matches!(
             event,
@@ -468,7 +688,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                                 } if *g_pointer == pointer_id => {
                                     viewer.view_transform =
                                         viewer.view_transform.then_translate(-(*pos - p));
-                                    reproject = true;
+                                    view_changed = true;
                                     *pos = p;
                                 }
                                 GestureState::DragZoomAbout {
@@ -480,7 +700,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                                     viewer.view_transform =
                                         viewer.view_transform.then_scale_about(sd, *about);
                                     viewer.view_scale *= sd;
-                                    reproject = true;
+                                    view_changed = true;
                                     *y = p.y;
                                 }
                                 GestureState::Hover if pointer_id == Some(PointerId::PRIMARY) => {
@@ -488,6 +708,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                                     let pick_started = Instant::now();
 
                                     let pick = viewer
+                                        .shared
                                         .picking_index
                                         .pick(dp, pick_dist * viewer.view_scale.recip());
 
@@ -499,7 +720,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                                             eprintln!("Pick took {pick_duration:?}");
                                         }
                                         viewer.pick = pick;
-                                        reproject = true;
+                                        view_changed = true;
                                     }
                                 }
                                 _ => {}
@@ -542,7 +763,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                                 .view_transform
                                 .then_scale_about(1. + d, Point { x, y });
                             viewer.view_scale *= 1. + d;
-                            reproject = true;
+                            view_changed = true;
                         }
                         PointerEvent::Gesture(PointerGestureEvent {
                             gesture: PointerGesture::Pinch(d),
@@ -557,7 +778,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                                 .view_transform
                                 .then_scale_about(1. + d as f64, Point { x, y });
                             viewer.view_scale *= 1. + d as f64;
-                            reproject = true;
+                            view_changed = true;
                         }
                         _ => {}
                     }
@@ -605,42 +826,21 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                 );
                 window.set_title(&title);
 
-                let picking_index = EntityIndex::new(&drawing);
-                let bounds = picking_index.bounds();
+                self.viewer = Some(setup_viewer(drawing, surface, scale_factor, window.clone()));
 
-                let (layout_cache, measurements) = self
-                    .tv_environment
-                    .compute_text_layouts_and_measures(&drawing.graphics, &drawing.render_layer);
-
-                let text_cull_index = TextCullIndex::new(&measurements);
-
-                let view_scale = (surface.config.height as f64 / bounds.size().height)
-                    .min(surface.config.width as f64 / bounds.size().width);
-
-                let view_transform = Affine::translate(Vec2 {
-                    x: -bounds.min_x(),
-                    y: -bounds.min_y(),
-                })
-                .then_scale(view_scale);
-
-                self.viewer = Some(DrawingViewer {
-                    td: drawing,
-                    picking_index,
-                    view_scale,
-                    view_transform,
-                    text_cull_index,
-                    pick: None,
-                    gestures: GestureState::default(),
-                    defer_reprojection: false,
-                    layout_cache,
-                });
-
-                reproject = true;
+                view_changed = true;
             }
 
             WindowEvent::RedrawRequested => {
-                let wgpu::SurfaceConfiguration { width, height, .. } = surface.config;
+                // Swap in the freshest scene from the worker.
+                if let Some(viewer) = &mut self.viewer
+                    && let Some((g, new_scene)) = viewer.pool.take_scene()
+                {
+                    viewer.rendered_generation = g;
+                    self.scene = new_scene;
+                }
 
+                let wgpu::SurfaceConfiguration { width, height, .. } = surface.config;
                 let device_handle = &self.context.devices[surface.dev_id];
 
                 let surface_texture = tracing::info_span!("get_current_texture").in_scope(|| {
@@ -651,7 +851,6 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                 });
 
                 tracing::info_span!("render_to_texture").in_scope(|| {
-                    // Render to the surface's texture
                     self.renderers[surface.dev_id]
                         .as_mut()
                         .unwrap()
@@ -661,7 +860,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                             &self.scene,
                             &surface.target_view,
                             &vello::RenderParams {
-                                base_color: Color::WHITE, // Background color
+                                base_color: Color::WHITE,
                                 width,
                                 height,
                                 antialiasing_method: AaConfig::Area,
@@ -696,139 +895,95 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
 
                 let _ = device_handle.device.poll(wgpu::PollType::Poll);
 
+                // If a newer generation is in flight, keep requesting
+                // redraws so we render it as soon as it completes.
                 if let Some(viewer) = &self.viewer
-                    && viewer.defer_reprojection
+                    && viewer.rendered_generation < viewer.pool.current_generation()
                 {
-                    reproject_deferred = true;
-                };
+                    window.request_redraw();
+                }
             }
             _ => {}
         }
 
-        if reproject || reproject_deferred {
-            tracing::info_span!("reproject").in_scope(|| {
-                let Some(viewer) = &mut self.viewer else {
-                    return;
-                };
-                if reproject_deferred {
-                    viewer.defer_reprojection = false;
-                }
-                if viewer.defer_reprojection {
-                    return;
-                }
-                // direct requests for reprojection until after the next redraw is complete.
-                viewer.defer_reprojection = reproject;
-                let reproject_started = Instant::now();
-                update_transform(
-                    &mut viewer.td.graphics,
-                    viewer.td.restroke_paints.clone(),
-                    viewer.view_transform,
-                    viewer.view_scale,
-                    window.scale_factor(),
-                );
-
-                let tl = viewer.view_transform.inverse() * Point { x: 0., y: 0. };
-                let br = viewer.view_transform.inverse()
-                    * Point {
-                        x: surface.config.width as f64,
-                        y: surface.config.height as f64,
-                    };
-
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "The loss of range and precision is acceptable."
-                )]
-                let visible = viewer.picking_index.query_items(
-                    tl.x as f32,
-                    tl.y as f32,
-                    br.x as f32,
-                    br.y as f32,
-                );
-
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "The loss of range and precision is acceptable."
-                )]
-                let visible_text = viewer.text_cull_index.query_items(
-                    tl.x as f32,
-                    tl.y as f32,
-                    br.x as f32,
-                    br.y as f32,
-                );
-
-                let culled_render_layer =
-                    viewer
-                        .td
-                        .render_layer
-                        .filter(|ih| match viewer.td.graphics.get(*ih) {
-                            GraphicsItem::FatShape(..) => visible.binary_search(ih).is_ok(),
-                            GraphicsItem::FatText(..) => visible_text.contains(ih),
-                        });
-                self.scene.reset();
-                self.tv_environment.add_render_layer_to_scene(
-                    &mut self.scene,
-                    &viewer.td.graphics,
-                    &culled_render_layer,
-                    Some(&viewer.layout_cache),
-                );
-
-                if let Some(pick) = viewer.pick {
-                    let mut gb = GraphicsBag::default();
-                    let mut rl = RenderLayer::default();
-
-                    gb.update_transform(Default::default(), viewer.view_transform);
-
-                    let paint = gb.register_paint(FatPaint {
-                        stroke: Stroke::new(1.414 / viewer.view_scale),
-                        stroke_paint: Some(palette::css::GOLDENROD.into()),
-                        fill_paint: None,
-                    });
-
-                    culled_render_layer
-                        .indices
-                        .iter()
-                        .filter(|ih| viewer.td.item_entity_map[ih] == pick)
-                        .for_each(|ih| {
-                            let GraphicsItem::FatShape(FatShape {
-                                transform, path, ..
-                            }) = viewer.td.graphics.get(*ih)
-                            else {
-                                return;
-                            };
-                            rl.push_with_bag(
-                                &mut gb,
-                                FatShape {
-                                    transform: *transform,
-                                    path: path.clone(),
-                                    paint,
-                                },
-                            );
-                        });
-
-                    self.tv_environment
-                        .add_render_layer_to_scene(&mut self.scene, &gb, &rl, None);
-                }
-
-                let reproject_duration =
-                    Instant::now().saturating_duration_since(reproject_started);
-                eprintln!("Reprojection/reencoding took {reproject_duration:?}");
-
-                window.request_redraw();
-            });
+        // Write the latest view params to the worker's pending slot.
+        // The worker self-paces: it takes whatever is in the slot when
+        // it finishes the current reprojection, or parks if the slot
+        // is empty. This means many input events during one
+        // reprojection collapse into a single follow-up reprojection.
+        if view_changed && let Some(viewer) = &self.viewer {
+            viewer
+                .pool
+                .update_params(viewer.reproject_params(surface, scale_factor));
+            // Request a redraw immediately so the main thread doesn't
+            // stall waiting for the worker to finish and call
+            // request_redraw. If the worker is fast enough, the fresh
+            // scene will already be in the completed slot by the time
+            // RedrawRequested fires. Otherwise we render the previous
+            // scene and the worker's request_redraw triggers a second
+            // render with the fresh one.
+            window.request_redraw();
         }
+    }
+}
+
+/// Set up a [`DrawingViewer`] from a loaded drawing.
+fn setup_viewer(
+    mut drawing: TDDrawing,
+    surface: &RenderSurface<'_>,
+    _scale_factor: f64,
+    window: Arc<Window>,
+) -> DrawingViewer {
+    let picking_index = EntityIndex::new(&drawing);
+    let bounds = picking_index.bounds();
+
+    let mut environment = tabulon_vello::Environment::default();
+    let (layout_cache, measurements) =
+        environment.compute_text_layouts_and_measures(&drawing.graphics, &drawing.render_layer);
+
+    let text_cull_index = TextCullIndex::new(&measurements);
+
+    let view_scale = (surface.config.height as f64 / bounds.size().height)
+        .min(surface.config.width as f64 / bounds.size().width);
+
+    let view_transform = Affine::translate(Vec2 {
+        x: -bounds.min_x(),
+        y: -bounds.min_y(),
+    })
+    .then_scale(view_scale);
+
+    // Adapt colors for light background before handing graphics to the worker.
+    light_adapt_paints(&mut drawing.graphics, &drawing.render_layer);
+
+    let shared = Arc::new(SharedDrawing {
+        render_layer: drawing.render_layer,
+        picking_index,
+        text_cull_index,
+        layout_cache,
+        item_entity_map: drawing.item_entity_map,
+        restroke_paints: drawing.restroke_paints,
+    });
+
+    let pool = ReprojectPool::start(Arc::clone(&shared), drawing.graphics, environment, window);
+
+    DrawingViewer {
+        shared,
+        pool,
+        pick: None,
+        view_scale,
+        view_transform,
+        rendered_generation: 0,
+        gestures: GestureState::default(),
     }
 }
 
 /// Load a drawing file into a drawing, and print some stats.
 fn load_drawing(p: impl AsRef<Path>) -> Result<TDDrawing> {
     let drawing_load_started = Instant::now();
-    let mut drawing =
-        tabulon_dxf::load_file_default_layers(p).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let drawing = tabulon_dxf::load_file_default_layers(p).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let drawing_load_duration = Instant::now().saturating_duration_since(drawing_load_started);
     eprintln!("Drawing took {drawing_load_duration:?} to load and translate.");
-
-    light_adapt_paints(&mut drawing.graphics, &drawing.render_layer);
 
     {
         let mut segment_count = 0;
@@ -849,7 +1004,7 @@ fn load_drawing(p: impl AsRef<Path>) -> Result<TDDrawing> {
         );
         let linewidths: BTreeSet<u64> = drawing.restroke_paints.iter().map(|r| r.weight).collect();
         eprintln!(
-            "There are {} unique linewidths, between {} µm and {} µm.",
+            "There are {} unique linewidths, between {} µm and {} µm.",
             linewidths.len(),
             linewidths.first().unwrap() / MICROMETER,
             linewidths.last().unwrap() / MICROMETER,
@@ -885,7 +1040,6 @@ fn main() -> Result<()> {
         renderers: vec![],
         state: RenderState::Suspended(None),
         scene: Scene::new(),
-        tv_environment: Default::default(),
         event_reducer: Default::default(),
         viewer: None,
         hover_threads: Default::default(),

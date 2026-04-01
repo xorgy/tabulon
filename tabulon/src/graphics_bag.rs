@@ -46,7 +46,7 @@ struct ManagedTransform {
 }
 
 /// Items for [`GraphicsBag`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(
     clippy::large_enum_variant,
     reason = "Making FatShape more indirect doesn't help, and there is no other elegant way to handle this."
@@ -59,7 +59,7 @@ pub enum GraphicsItem {
 }
 
 /// Bag of [`GraphicsItem`]s.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GraphicsBag {
     /// [`GraphicsItem`]s in the bag.
     pub items: Vec<GraphicsItem>,
