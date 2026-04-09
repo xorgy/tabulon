@@ -6,7 +6,7 @@
 use tabulon::{
     DirectIsometry, GraphicsBag, GraphicsItem, ItemHandle,
     peniko::{
-        Brush, Color, Fill,
+        Brush, Color,
         kurbo::{Affine, Size, Vec2},
     },
     render_layer::RenderLayer,
@@ -15,7 +15,12 @@ use tabulon::{
 };
 
 use parley::{FontContext, Layout, LayoutContext, PositionedLayoutItem};
-use vello::{Scene, peniko::Fill::NonZero};
+use vello_common::{
+    glyph::Glyph,
+    paint::{ImageSource, PaintType},
+    peniko::{Brush as HybridBrush, Fill::NonZero, ImageBrush},
+};
+use vello_hybrid::Scene;
 
 extern crate alloc;
 use alloc::collections::BTreeMap;
@@ -39,7 +44,7 @@ pub struct Environment {
 pub type LayoutCache = BTreeMap<ItemHandle, Layout<Option<Color>>>;
 
 impl Environment {
-    /// Add a [`RenderLayer`] to a Vello [`Scene`].
+    /// Add a [`RenderLayer`] to a Vello Hybrid [`Scene`].
     #[tracing::instrument(skip_all)]
     pub fn add_render_layer_to_scene(
         &mut self,
@@ -66,10 +71,16 @@ impl Environment {
                     } = graphics.get_paint(*paint);
 
                     if let Some(fill_paint) = fill_paint {
-                        scene.fill(NonZero, transform, fill_paint, None, path.as_ref());
+                        scene.set_fill_rule(NonZero);
+                        scene.set_transform(transform);
+                        scene.set_paint(convert_brush(fill_paint));
+                        scene.fill_path(path.as_ref());
                     }
                     if let Some(stroke_paint) = stroke_paint {
-                        scene.stroke(stroke, transform, stroke_paint, None, path.as_ref());
+                        scene.set_transform(transform);
+                        scene.set_stroke(stroke.clone());
+                        scene.set_paint(convert_brush(stroke_paint));
+                        scene.stroke_path(path.as_ref());
                     }
                 }
                 GraphicsItem::FatText(FatText {
@@ -262,36 +273,43 @@ fn draw_layout(
             let fudge = run.font_size() as f64 / 1000.0;
 
             let synthesis = run.synthesis();
+            scene.set_transform(transform);
+            scene.set_paint(convert_brush(fill_paint));
             scene
-                .draw_glyphs(run.font())
-                // TODO: Color will come from styled text.
-                .brush(fill_paint)
+                .glyph_run(run.font())
                 .hint(false)
-                .transform(transform)
-                .glyph_transform(Some(if let Some(angle) = synthesis.skew() {
+                .glyph_transform(if let Some(angle) = synthesis.skew() {
                     Affine::scale(fudge) * Affine::skew(angle.to_radians().tan() as f64, 0.0)
                 } else {
                     Affine::scale(fudge)
-                }))
+                })
                 // Small font sizes are quantized, multiplying by
                 // 50 and then scaling by 1 / 50 at the glyph level
                 // works around this, but it is a hack.
                 .font_size(1000_f32)
                 .normalized_coords(run.normalized_coords())
-                .draw(
-                    Fill::NonZero,
-                    glyph_run.glyphs().map(|g| {
-                        let gx = x + g.x;
-                        let gy = y - g.y;
-                        x += g.advance;
-                        vello::Glyph {
-                            id: g.id,
-                            x: gx,
-                            y: gy,
-                        }
-                    }),
-                );
+                .fill_glyphs(glyph_run.glyphs().map(|g| {
+                    let gx = x + g.x;
+                    let gy = y - g.y;
+                    x += g.advance;
+                    Glyph {
+                        id: g.id,
+                        x: gx,
+                        y: gy,
+                    }
+                }));
         }
+    }
+}
+
+fn convert_brush(brush: &Brush) -> PaintType {
+    match brush {
+        Brush::Solid(color) => HybridBrush::Solid(*color),
+        Brush::Gradient(gradient) => HybridBrush::Gradient(gradient.clone()),
+        Brush::Image(image) => HybridBrush::Image(ImageBrush {
+            image: ImageSource::from_peniko_image_data(&image.image),
+            sampler: image.sampler,
+        }),
     }
 }
 

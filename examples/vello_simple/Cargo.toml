@@ -10,7 +10,9 @@ publish = false
 [dependencies]
 anyhow = "1.0.98"
 pollster = "0.4"
-vello = "0.8.0"
+vello_common = { workspace = true }
+vello_hybrid = { workspace = true }
+wgpu = { workspace = true }
 winit = "0.30.13"
 
 tabulon = { version = "0.1.0", path = "../../tabulon" }

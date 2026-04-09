@@ -29,14 +29,17 @@
 //! character escapes are translated properly or at all.
 //!
 //! In general, this viewer is quite scalable, but will struggle when the density of elements in a
-//! given position is high enough, due to limitations in the classic Vello rendering process.
+//! given position is high enough, due to the cost of culling, picking, and rasterizing dense vector
+//! content.
 
 #![windows_subsystem = "windows"]
+
+#[path = "../../render_context.rs"]
+mod render_context;
 
 use anyhow::Result;
 use dpi::PhysicalPosition;
 use joto_constants::length::u64::{INCH, MICROMETER};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -50,19 +53,17 @@ use ui_events::{
     },
 };
 use ui_events_winit::{WindowEventReducer, WindowEventTranslation};
-use vello::kurbo::{
+use vello_common::kurbo::{
     Affine, DEFAULT_ACCURACY, ParamCurveNearest, PathSeg, Point, Rect, Shape, Size, Stroke, Vec2,
 };
-use vello::peniko::{Brush, Color, color::palette};
-use vello::util::{RenderContext, RenderSurface};
-use vello::{AaConfig, Renderer, RendererOptions, Scene};
+use vello_common::peniko::{Brush, Color, color::palette};
+use vello_hybrid::{RenderSize, Renderer, Scene};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::Window;
 
-use vello::wgpu;
+use render_context::{RenderContext, RenderSurface, create_vello_renderer, create_winit_window};
 
 use tabulon_dxf::{EntityHandle, RestrokePaint, TDDrawing};
 
@@ -172,9 +173,9 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
 
         let window = cached_window
             .take()
-            .unwrap_or_else(|| create_winit_window(event_loop));
+            .unwrap_or_else(|| create_winit_window(event_loop, 960, 720, "Tabulon DXF Viewer"));
 
-        // Create a vello Surface.
+        // Create a Vello Hybrid surface.
         let size = window.inner_size();
         let surface_future = {
             let surface = self
@@ -185,7 +186,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
             let dev_id = pollster::block_on(self.context.device(Some(&surface)))
                 .expect("No compatible device");
             let device_handle = &self.context.devices[dev_id];
-            let capabilities = surface.get_capabilities(device_handle.adapter());
+            let capabilities = surface.get_capabilities(&device_handle.adapter);
             let present_mode = if capabilities
                 .present_modes
                 .contains(&wgpu::PresentMode::Mailbox)
@@ -194,19 +195,25 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
             } else {
                 wgpu::PresentMode::AutoVsync
             };
-            self.context
-                .create_render_surface(surface, size.width, size.height, present_mode)
+            let format = preferred_surface_format(&capabilities.formats);
+            self.context.create_render_surface(
+                surface,
+                size.width,
+                size.height,
+                present_mode,
+                format,
+            )
         };
 
         let scale_factor = window.scale_factor();
 
-        let surface = pollster::block_on(surface_future).expect("Error creating surface");
+        let surface = pollster::block_on(surface_future);
+        self.scene = scene_for_surface(size.width, size.height);
 
-        // Create a vello Renderer for the surface (using its device id).
+        // Create a Vello Hybrid renderer for the surface (using its device id).
         self.renderers
             .resize_with(self.context.devices.len(), || None);
-        self.renderers[surface.dev_id]
-            .get_or_insert_with(|| create_vello_renderer(&self.context, &surface));
+        self.renderers[surface.dev_id] = Some(create_vello_renderer(&self.context, &surface));
 
         if let Some(path_arg) = std::env::args().next_back() {
             match load_drawing(&path_arg) {
@@ -571,6 +578,8 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
             WindowEvent::Resized(size) => {
                 self.context
                     .resize_surface(surface, size.width, size.height);
+                self.scene = scene_for_surface(size.width, size.height);
+                reproject = true;
             }
 
             WindowEvent::HoveredFileCancelled => {
@@ -642,6 +651,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                 let wgpu::SurfaceConfiguration { width, height, .. } = surface.config;
 
                 let device_handle = &self.context.devices[surface.dev_id];
+                let render_size = RenderSize { width, height };
 
                 let surface_texture = tracing::info_span!("get_current_texture").in_scope(|| {
                     surface
@@ -649,43 +659,44 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                         .get_current_texture()
                         .expect("failed to get surface texture")
                 });
+                let texture_view = surface_texture
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                let mut encoder =
+                    device_handle
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Vello Hybrid Render to Surface"),
+                        });
 
-                tracing::info_span!("render_to_texture").in_scope(|| {
-                    // Render to the surface's texture
+                tracing::info_span!("clear_surface").in_scope(|| {
+                    clear_texture(
+                        &mut encoder,
+                        &texture_view,
+                        wgpu::Color {
+                            r: 1.0,
+                            g: 1.0,
+                            b: 1.0,
+                            a: 1.0,
+                        },
+                    );
+                });
+
+                tracing::info_span!("render_to_surface").in_scope(|| {
                     self.renderers[surface.dev_id]
                         .as_mut()
                         .unwrap()
-                        .render_to_texture(
+                        .render(
+                            &self.scene,
                             &device_handle.device,
                             &device_handle.queue,
-                            &self.scene,
-                            &surface.target_view,
-                            &vello::RenderParams {
-                                base_color: Color::WHITE, // Background color
-                                width,
-                                height,
-                                antialiasing_method: AaConfig::Area,
-                            },
+                            &mut encoder,
+                            &render_size,
+                            &texture_view,
                         )
-                        .expect("failed to render to the texture");
+                        .expect("failed to render to the surface");
                 });
-
-                tracing::info_span!("texture_surface_blit").in_scope(|| {
-                    let mut encoder = device_handle.device.create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor {
-                            label: Some("Surface Blit"),
-                        },
-                    );
-                    surface.blitter.copy(
-                        &device_handle.device,
-                        &mut encoder,
-                        &surface.target_view,
-                        &surface_texture
-                            .texture
-                            .create_view(&wgpu::TextureViewDescriptor::default()),
-                    );
-                    device_handle.queue.submit([encoder.finish()]);
-                });
+                device_handle.queue.submit([encoder.finish()]);
 
                 tracing::info_span!("present_surface").in_scope(|| {
                     surface_texture.present();
@@ -694,7 +705,10 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                 #[cfg(feature = "tracing-tracy")]
                 tracy_client::frame_mark();
 
-                let _ = device_handle.device.poll(wgpu::PollType::Poll);
+                device_handle
+                    .device
+                    .poll(wgpu::PollType::Poll)
+                    .expect("failed to poll device");
 
                 if let Some(viewer) = &self.viewer
                     && viewer.defer_reprojection
@@ -884,7 +898,7 @@ fn main() -> Result<()> {
         context: RenderContext::new(),
         renderers: vec![],
         state: RenderState::Suspended(None),
-        scene: Scene::new(),
+        scene: scene_for_surface(960, 720),
         tv_environment: Default::default(),
         event_reducer: Default::default(),
         viewer: None,
@@ -898,27 +912,43 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Helper function that creates a Winit window and returns it (wrapped in an Arc for sharing between threads)
-fn create_winit_window(event_loop: &ActiveEventLoop) -> Arc<Window> {
-    let attr = Window::default_attributes()
-        .with_inner_size(LogicalSize::new(960, 720))
-        .with_resizable(true)
-        .with_title("Tabulon DXF Viewer");
-    Arc::new(event_loop.create_window(attr).unwrap())
+fn preferred_surface_format(formats: &[wgpu::TextureFormat]) -> wgpu::TextureFormat {
+    formats
+        .iter()
+        .copied()
+        .find(|format| {
+            matches!(
+                format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+            )
+        })
+        .unwrap_or_else(|| formats[0])
 }
 
-/// Helper function that creates a vello `Renderer` for a given `RenderContext` and `RenderSurface`
-fn create_vello_renderer(render_cx: &RenderContext, surface: &RenderSurface<'_>) -> Renderer {
-    Renderer::new(
-        &render_cx.devices[surface.dev_id].device,
-        RendererOptions {
-            use_cpu: false,
-            antialiasing_support: vello::AaSupport::area_only(),
-            num_init_threads: NonZeroUsize::new(1),
-            pipeline_cache: None,
-        },
+fn scene_for_surface(width: u32, height: u32) -> Scene {
+    Scene::new(
+        u16::try_from(width.max(1)).expect("surface width exceeds Scene limits"),
+        u16::try_from(height.max(1)).expect("surface height exceeds Scene limits"),
     )
-    .expect("Couldn't create renderer")
+}
+
+fn clear_texture(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, color: wgpu::Color) {
+    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("Clear Surface"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(color),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        occlusion_query_set: None,
+        timestamp_writes: None,
+        multiview_mask: None,
+    });
 }
 
 /// Update the transform/scale in all the items in a `GraphicsBag`.
